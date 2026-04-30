@@ -99,7 +99,66 @@ class LLMClientFactory:
 
     @staticmethod
     def create(config: LLMConfig) -> LLMClient:
-        """Create an LLM client based on the configured provider."""
+        """Create an LLM client. If config.fallback_chain is set, returns a
+        FailoverLLMClient wrapping each provider in chain order."""
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        # PATCH (donut #1141): if a failover chain is configured, build wrapped client.
+        if getattr(config, 'fallback_chain', None):
+            return LLMClientFactory._create_failover(config, logger)
+
+        return LLMClientFactory._create_single(config)
+
+    @staticmethod
+    def _create_failover(config: LLMConfig, logger) -> LLMClient:  # type: ignore[no-untyped-def]
+        from services.failover_llm_client import FailoverLLMClient
+
+        chain = config.fallback_chain or []
+        if not chain:
+            return LLMClientFactory._create_single(config)
+
+        inner: list[tuple[str, LLMClient]] = []
+        for name in chain:
+            sub = config.model_copy(deep=True)
+            sub.provider = name
+            sub.fallback_chain = None  # avoid recursion
+            # Per-provider model override if set in the provider block
+            provider_block = getattr(sub.providers, name, None) if sub.providers else None
+            per_provider_model = getattr(provider_block, 'model', None) if provider_block else None
+            if per_provider_model:
+                sub.model = per_provider_model
+            try:
+                client = LLMClientFactory._create_single(sub)
+                inner.append((name, client))
+                logger.info(
+                    'Failover chain: added provider=%s model=%s',
+                    name,
+                    sub.model,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    'Failover chain: skipping provider=%s (init failed: %s)', name, e
+                )
+        if not inner:
+            raise ValueError(
+                f'No providers in failover chain {chain} could be initialized'
+            )
+        if len(inner) == 1:
+            logger.info('Failover chain has only 1 provider initialized — skipping wrapper')
+            return inner[0][1]
+        return FailoverLLMClient(
+            inner,
+            circuit_breaker_threshold=config.circuit_breaker_threshold,
+            circuit_breaker_window_sec=config.circuit_breaker_window_sec,
+            circuit_breaker_open_sec=config.circuit_breaker_open_sec,
+            notify_on_chain_failure=config.notify_on_chain_failure,
+        )
+
+    @staticmethod
+    def _create_single(config: LLMConfig) -> LLMClient:
+        """Create one LLM client based on the configured provider."""
         import logging
 
         logger = logging.getLogger(__name__)

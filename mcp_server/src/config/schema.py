@@ -90,6 +90,7 @@ class OpenAIProviderConfig(BaseModel):
     api_key: str | None = None
     api_url: str = 'https://api.openai.com/v1'
     organization_id: str | None = None
+    model: str | None = None  # PATCH (donut #1141): per-provider model override for failover chain
 
 
 class AzureOpenAIProviderConfig(BaseModel):
@@ -108,6 +109,7 @@ class AnthropicProviderConfig(BaseModel):
     api_key: str | None = None
     api_url: str = 'https://api.anthropic.com'
     max_retries: int = 3
+    model: str | None = None  # PATCH (donut #1141)
 
 
 class GeminiProviderConfig(BaseModel):
@@ -116,6 +118,7 @@ class GeminiProviderConfig(BaseModel):
     api_key: str | None = None
     project_id: str | None = None
     location: str = 'us-central1'
+    model: str | None = None  # PATCH (donut #1141)
 
 
 class GroqProviderConfig(BaseModel):
@@ -123,6 +126,7 @@ class GroqProviderConfig(BaseModel):
 
     api_key: str | None = None
     api_url: str = 'https://api.groq.com/openai/v1'
+    model: str | None = None  # PATCH (donut #1141)
 
 
 class VoyageProviderConfig(BaseModel):
@@ -153,6 +157,32 @@ class LLMConfig(BaseModel):
     )
     max_tokens: int = Field(default=4096, description='Max tokens')
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
+
+    # PATCH (donut #1141): provider failover chain. When set, on RateLimitError
+    # or 5xx the FailoverLLMClient routes to the next provider in the list. The
+    # first entry is treated as primary; `provider` field is overridden if both
+    # are set.
+    fallback_chain: list[str] | None = Field(
+        default=None,
+        description='Ordered provider list for failover (e.g. ["gemini","anthropic","openai"]).',
+    )
+    circuit_breaker_threshold: int = Field(
+        default=3,
+        description='Failures within window before a provider is opened (skipped).',
+    )
+    circuit_breaker_window_sec: int = Field(
+        default=300,
+        description='Sliding window in seconds for counting failures.',
+    )
+    circuit_breaker_open_sec: int = Field(
+        default=600,
+        description='How long a provider stays opened before retry.',
+    )
+    notify_on_chain_failure: bool = Field(
+        default=True,
+        description='When ALL providers in the chain are exhausted/open, write a marker file '
+        '(~/code/donut/state/graphiti-chain-failures.log) for cross-session visibility.',
+    )
 
 
 class EmbedderProvidersConfig(BaseModel):
