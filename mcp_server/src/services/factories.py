@@ -302,27 +302,39 @@ class LLMClientFactory:
                 return GroqClient(config=llm_config)
 
             case 'ollama':
-                # PATCH (donut #1079): local-first extraction tier. Reuses the
-                # OpenAIClient pointed at the local Ollama OpenAI-compatible
-                # endpoint. The V3 prompt branching in graphiti_core/prompts
-                # activates when this provider is in use.
+                # PATCH (donut #1211): activated. Routes through the dedicated
+                # OllamaClient (subclass of OpenAIGenericClient) which uses
+                # plain chat.completions.create with json_object/json_schema
+                # response formats — Ollama does NOT implement OpenAI's
+                # responses.parse endpoint, so OpenAIClient does not work.
+                #
+                # The V3 entity-extraction prompt activates for the graphiti
+                # server process via env GRAPHITI_USE_V3_PROMPT=1
+                # (see graphiti_core/prompts/extract_nodes.py). Set it on the
+                # systemd unit that runs Ollama-graphiti, NOT on the Gemini
+                # graphiti instance.
                 if not config.providers.ollama:
                     raise ValueError('Ollama provider configuration not found')
 
                 from graphiti_core.llm_client.config import LLMConfig as CoreLLMConfig
+                from graphiti_core.llm_client.ollama_client import OllamaClient
 
                 ollama_cfg = config.providers.ollama
+                model_name = ollama_cfg.model or config.model
                 llm_config = CoreLLMConfig(
                     api_key=ollama_cfg.api_key or 'ollama',
                     base_url=ollama_cfg.api_url,
-                    model=config.model,
-                    small_model=config.model,
+                    model=model_name,
+                    small_model=model_name,
                     temperature=config.temperature,
                     max_tokens=config.max_tokens,
                 )
-                logger.info('Creating Ollama (local) LLM client at %s model=%s',
-                            ollama_cfg.api_url, config.model)
-                return OpenAIClient(config=llm_config, reasoning=None, verbosity=None)
+                logger.info(
+                    'Creating Ollama (local) LLM client at %s model=%s',
+                    ollama_cfg.api_url,
+                    model_name,
+                )
+                return OllamaClient(config=llm_config, max_tokens=config.max_tokens)
 
             case _:
                 raise ValueError(f'Unsupported LLM provider: {provider}')
