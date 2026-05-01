@@ -137,6 +137,20 @@ class VoyageProviderConfig(BaseModel):
     model: str = 'voyage-3'
 
 
+class OllamaProviderConfig(BaseModel):
+    """Ollama (local OpenAI-compatible) provider configuration.
+
+    PATCH (donut #1079): enables tiered local-first extraction. Routes through
+    the local Ollama OpenAI-compatible endpoint. Designed to be paired with the
+    V3 entity-extraction prompt (see graphiti_core/prompts/extract_nodes.py).
+    """
+
+    api_url: str = 'http://localhost:11434/v1'
+    api_key: str = 'ollama'  # ollama ignores the key but the OpenAI client requires one
+    model: str | None = None
+    max_retries: int = 1
+
+
 class LLMProvidersConfig(BaseModel):
     """LLM providers configuration."""
 
@@ -145,6 +159,7 @@ class LLMProvidersConfig(BaseModel):
     anthropic: AnthropicProviderConfig | None = None
     gemini: GeminiProviderConfig | None = None
     groq: GroqProviderConfig | None = None
+    ollama: OllamaProviderConfig | None = None  # PATCH (donut #1079)
 
 
 class LLMConfig(BaseModel):

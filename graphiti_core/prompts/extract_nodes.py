@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 from typing import Any, Protocol, TypedDict
 
 from pydantic import BaseModel, Field
@@ -23,6 +24,124 @@ from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
 from .models import Message, PromptFunction, PromptVersion
 from .prompt_helpers import to_prompt_json
 from .snippets import summary_instructions
+
+
+# PATCH (donut #1079): V3 prompt for local Qwen 2.5 32B extraction. Tuned to
+# 87.7% recall vs cloud Gemini in tonight's bench. Activated when the env var
+# GRAPHITI_USE_V3_PROMPT=1 is set on the graphiti server process. The cloud
+# providers keep using the original prompts (which they handle fine).
+_V3_SYSTEM = """You are an entity extraction specialist building a knowledge graph.
+Your job: extract EVERY specific named entity mentioned in the message, including
+ones that may seem trivial or repetitive. The downstream system depends on
+COMPLETE entity coverage, not selectivity. Err on the side of MORE extraction.
+
+CRITICAL EXTRACTION RULES (Qwen-specific):
+
+1. EMAIL ADDRESSES are entities. Extract every email address verbatim as its own
+   Person entity (name = the full email). Do not skip them as "boilerplate".
+   Example: "alice@gmail.com, bob@gmail.com" -> 2 Person entities.
+
+2. URLs and Zoom/meeting links are Other entities. Extract them verbatim.
+   Also extract Zoom Meeting IDs and Passcodes as Other entities.
+   Example: "Zoom Meeting ID: 884 2558 5618" -> Other entity "Zoom Meeting ID: 884 2558 5618".
+
+3. FLAT LISTS: when content lists items (states, sections, names, products),
+   each item is its own entity.
+   "Alabama, Alaska, Arizona" -> 3 Location entities.
+   "Crops Sheet, Casking Sheet, Jar vs Keg Sheet" -> 3 Other entities.
+
+4. FULL NAMES: extract the LONGEST form of a person's name in the text.
+   "Garrett Griffin-Morales" not just "Garrett Griffin".
+   "Sarah Chen-Rodriguez" not just "Sarah Chen".
+
+5. EVENT / ACTIVITY NAMES: multi-word named events are entities.
+   "Teacher Appreciation Week", "Pumpkin Patch Event", "Flight to Orlando (DL 2415)".
+
+6. STREET ADDRESSES are Location entities. Extract verbatim.
+
+7. ORGANIZATION VARIANTS: "Discover Bank", "Discover Card", "Discover Financial
+   Services" are 3 distinct Organization entities if all mentioned.
+
+8. SUBJECT LINES / DOCUMENT TITLES / SECTION HEADINGS are Other entities.
+
+9. TECHNICAL CONCEPTS / ERROR CODES / TICKET IDS / BACKLOG ITEMS are Other entities.
+   Extract: "circuit breakers", "HTTP 5xx", "RateLimitError", "donut #1141",
+   "backlog item #1107", "episode", "family-roster ingestion", "rate limit".
+   These are technical "things" the knowledge graph tracks.
+
+10. PRODUCTS / GAMES / TOOLS are Organization or Other entities.
+
+NEVER extract: pronouns (I/you/he/she/we), bare kinship terms (mom/dad/son
+without a name), abstract feelings (joy/sad), generic single nouns
+(meeting/email/day) UNLESS they are part of a named multi-word phrase or
+technical concept."""
+
+
+def _v3_active() -> bool:
+    """Check if the V3 (local-Qwen-tuned) prompt should be used.
+
+    Set GRAPHITI_USE_V3_PROMPT=1 on the graphiti server process to enable.
+    Default: 0 (use the original cloud-tuned prompts).
+    """
+    return os.environ.get('GRAPHITI_USE_V3_PROMPT', '0').strip() in ('1', 'true', 'yes', 'on')
+
+
+def _v3_user_prompt(context: dict[str, Any]) -> str:
+    """Build the V3 user prompt body. Mirrors scratch/bench_qwen_v3_prompt.py
+    but adapted to graphiti's context dict (entity_types, episode_content)."""
+    return f"""<EXAMPLE 1: people + emails + urls>
+Input:
+"Garrett Griffin-Morales met with Sarah Chen from Inovalon at their Bowie MD office.
+RSVPs: alice@gmail.com, bob@gmail.com. Zoom link: https://zoom.us/j/123."
+
+Output:
+{{"extracted_entities": [
+  {{"name": "Garrett Griffin-Morales", "entity_type_id": 0}},
+  {{"name": "Sarah Chen", "entity_type_id": 0}},
+  {{"name": "Inovalon", "entity_type_id": 1}},
+  {{"name": "Bowie MD", "entity_type_id": 2}},
+  {{"name": "alice@gmail.com", "entity_type_id": 0}},
+  {{"name": "bob@gmail.com", "entity_type_id": 0}},
+  {{"name": "https://zoom.us/j/123", "entity_type_id": 4}}
+]}}
+</EXAMPLE 1>
+
+<EXAMPLE 2: technical concepts + ticket IDs>
+Input:
+"Tested donut #1141 failover. Circuit breakers tripped on HTTP 5xx from Gemini.
+RateLimitError fallback to Anthropic worked. Episodes ingested cleanly."
+
+Output:
+{{"extracted_entities": [
+  {{"name": "donut #1141", "entity_type_id": 4}},
+  {{"name": "circuit breakers", "entity_type_id": 4}},
+  {{"name": "HTTP 5xx", "entity_type_id": 4}},
+  {{"name": "Gemini", "entity_type_id": 1}},
+  {{"name": "RateLimitError", "entity_type_id": 4}},
+  {{"name": "Anthropic", "entity_type_id": 1}}
+]}}
+</EXAMPLE 2>
+
+<ENTITY TYPES>
+{context.get('entity_types', '')}
+</ENTITY TYPES>
+
+<MESSAGE>
+{context.get('episode_content', '')}
+</MESSAGE>
+
+Extract step by step:
+1. ALL email addresses -> Person.
+2. ALL URLs, zoom links, meeting IDs, passcodes -> Other.
+3. ALL person names (longest form, with hyphenated last names).
+4. ALL street addresses, cities, states, named places -> Location.
+5. ALL companies, products, games, named services -> Organization.
+6. ALL named events, document titles, section headings, subject lines -> Event/Other.
+7. ALL technical concepts, error codes, ticket IDs, backlog items -> Other.
+8. If a flat list of items appears, each item is its own entity.
+
+Be MORE extractive than your default. Output JSON only:
+{{"extracted_entities": [{{"name": "X", "entity_type_id": N}}, ...]}}"""
 
 
 class ExtractedEntity(BaseModel):
@@ -81,6 +200,12 @@ class Versions(TypedDict):
 
 
 def extract_message(context: dict[str, Any]) -> list[Message]:
+    # PATCH (donut #1079): V3 prompt branch for local Qwen.
+    if _v3_active():
+        return [
+            Message(role='system', content=_V3_SYSTEM),
+            Message(role='user', content=_v3_user_prompt(context)),
+        ]
     sys_prompt = (
         'You are an entity extraction specialist for conversational messages. '
         'NEVER extract abstract concepts, feelings, or generic words.'
@@ -211,6 +336,12 @@ Do NOT extract: "basket" (ambiguous bare noun that depends on sentence context)
 
 
 def extract_json(context: dict[str, Any]) -> list[Message]:
+    # PATCH (donut #1079): V3 prompt branch for local Qwen.
+    if _v3_active():
+        return [
+            Message(role='system', content=_V3_SYSTEM),
+            Message(role='user', content=_v3_user_prompt(context)),
+        ]
     sys_prompt = (
         'You are an entity extraction specialist for JSON data. '
         'NEVER extract abstract concepts, dates, or generic field values.'
@@ -276,6 +407,12 @@ Do NOT extract: "photo" (generic media noun), "event" (generic event noun), "gov
 
 
 def extract_text(context: dict[str, Any]) -> list[Message]:
+    # PATCH (donut #1079): V3 prompt branch for local Qwen.
+    if _v3_active():
+        return [
+            Message(role='system', content=_V3_SYSTEM),
+            Message(role='user', content=_v3_user_prompt(context)),
+        ]
     sys_prompt = (
         'You are an entity extraction specialist for unstructured text. '
         'NEVER extract abstract concepts, feelings, or generic words.'

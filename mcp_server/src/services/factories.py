@@ -301,6 +301,29 @@ class LLMClientFactory:
                 )
                 return GroqClient(config=llm_config)
 
+            case 'ollama':
+                # PATCH (donut #1079): local-first extraction tier. Reuses the
+                # OpenAIClient pointed at the local Ollama OpenAI-compatible
+                # endpoint. The V3 prompt branching in graphiti_core/prompts
+                # activates when this provider is in use.
+                if not config.providers.ollama:
+                    raise ValueError('Ollama provider configuration not found')
+
+                from graphiti_core.llm_client.config import LLMConfig as CoreLLMConfig
+
+                ollama_cfg = config.providers.ollama
+                llm_config = CoreLLMConfig(
+                    api_key=ollama_cfg.api_key or 'ollama',
+                    base_url=ollama_cfg.api_url,
+                    model=config.model,
+                    small_model=config.model,
+                    temperature=config.temperature,
+                    max_tokens=config.max_tokens,
+                )
+                logger.info('Creating Ollama (local) LLM client at %s model=%s',
+                            ollama_cfg.api_url, config.model)
+                return OpenAIClient(config=llm_config, reasoning=None, verbosity=None)
+
             case _:
                 raise ValueError(f'Unsupported LLM provider: {provider}')
 
