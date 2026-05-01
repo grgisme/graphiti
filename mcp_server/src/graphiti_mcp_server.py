@@ -645,13 +645,29 @@ async def get_episodes(
             else []
         )
 
-        # Get episodes from the driver directly
+        # Get episodes from the driver directly.
+        # donut #1196 fix: FalkorDB is a multi-tenant graph DB and each group_id lives
+        # in its own graph (graph name == group_id). EpisodicNode.get_by_group_ids by
+        # itself only queries the driver's default database, so cross-group lookups
+        # silently returned [] for any group that wasn't the default. We now clone the
+        # driver once per group, query its tenant graph, and merge results.
         from graphiti_core.nodes import EpisodicNode
 
         if effective_group_ids:
-            episodes = await EpisodicNode.get_by_group_ids(
-                client.driver, effective_group_ids, limit=max_episodes
+            episodes = []
+            for gid in effective_group_ids:
+                tenant_driver = client.driver.clone(database=gid)
+                gid_eps = await EpisodicNode.get_by_group_ids(
+                    tenant_driver, [gid], limit=max_episodes
+                )
+                episodes.extend(gid_eps)
+            # Apply final cap across the merged set, ordered by created_at desc when
+            # available so the newest hit per group still surfaces first.
+            episodes.sort(
+                key=lambda e: e.created_at.isoformat() if e.created_at else '',
+                reverse=True,
             )
+            episodes = episodes[:max_episodes]
         else:
             # If no group IDs, we need to use a different approach
             # For now, return empty list when no group IDs specified

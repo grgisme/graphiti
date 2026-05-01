@@ -420,6 +420,14 @@ class FalkorDriver(GraphDriver):
         if len(sanitized_query.split(' ')) + len(group_ids or '') >= max_query_length:
             return ''
 
+        # donut #1196 fix: when the user query collapses to nothing (pure stopwords,
+        # whitespace, or only punctuation), we used to emit "(@group_id:...) ()" which
+        # FalkorDB's RediSearch parser rejects with a syntax error near the group filter.
+        # Detect that case and either return only the group filter or an empty string so
+        # callers see "no results" instead of an opaque parser error.
+        if not sanitized_query:
+            return group_filter
+
         full_query = group_filter + ' (' + sanitized_query + ')'
 
         return full_query
